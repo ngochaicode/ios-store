@@ -1,0 +1,68 @@
+name:  Sign App & Gen Plist
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_path:
+        description: 'Tên file IPA bạn đã up lên (ví dụ: game.ipa)'
+        required: true
+        default: 'game.ipa'
+
+jobs:
+  sign-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v3
+
+      - name: 🛠️ Cài đặt công cụ
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip zip python3-plistlib
+          wget https://github.com/zhlynn/zsign/releases/download/v1.1.2/zsign
+          chmod +x zsign
+          sudo mv zsign /usr/local/bin/
+
+      - name: 🔐 Chuẩn bị Chứng chỉ
+        run: |
+          echo "${{ secrets.P12_BASE64 }}" | base64 --decode > cert.p12
+          echo "${{ secrets.PROVISION_BASE64 }}" | base64 --decode > embedded.mobileprovision
+
+      - name: ✍️ Ký App
+        run: |
+          zsign -k cert.p12 -p "${{ secrets.P12_PASSWORD }}" -m embedded.mobileprovision -o signed_app.ipa -z 9 "${{ github.event.inputs.ipa_path }}"
+
+      - name: 🕵️‍♂️ Trích xuất Bundle ID & Info
+        id: extract_info
+        run: |
+          python3 -c "
+          import zipfile, plistlib, os
+          with zipfile.ZipFile('signed_app.ipa', 'r') as z:
+              info_path = [n for n in z.namelist() if 'Payload/' in n and n.endswith('Info.plist')][0]
+              with z.open(info_path) as f:
+                  pl = plistlib.load(f)
+                  with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+                      out.write(f'BID={pl.get('CFBundleIdentifier')}\n')
+                      out.write(f'NAME={pl.get('CFBundleDisplayName', pl.get('CFBundleName'))}\n')
+                      out.write(f'VER={pl.get('CFBundleShortVersionString', '1.0')}\n')
+          "
+
+      - name: 📝 Tạo file manifest.plist
+        run: |
+          IPA_URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/signed_app.ipa"
+          cat <<EOF > manifest.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict><key>items</key><array><dict><key>assets</key><array><dict><key>kind</key><string>software-package</string><key>url</key><string>$IPA_URL</string></dict></array><key>metadata</key><dict><key>bundle-identifier</key><string>${{ steps.extract_info.outputs.BID }}</string><key>bundle-version</key><string>${{ steps.extract_info.outputs.VER }}</string><key>kind</key><string>software</string><key>title</key><string>${{ steps.extract_info.outputs.NAME }}</string></dict></dict></array></dict></plist>
+          EOF
+
+      - name: 🚀 Lưu kết quả
+        run: |
+          git config --global user.name "Bot"
+          git config --global user.email "bot@github.com"
+          git add signed_app.ipa manifest.plist
+          git commit -m "Done signing"
+          git push
